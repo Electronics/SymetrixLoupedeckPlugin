@@ -139,6 +139,12 @@
             while (this.runThread) {
                 var item = this.writeQueue.Take();
                 Debug.WriteLine($"New item for read/write! {item.data}");
+
+                // check connection
+                if (!this.isConnected()) {
+                    this.connect();
+                }
+
                 if (item != null) {
                     // if we have an item, write to the Symetrix and read back the ACK / data
                     this._write(item.data);
