@@ -19,14 +19,19 @@
 
         private BlockingCollection<WriteQueueItem> writeQueue;
         private Thread readWriteThread;
+		private Thread keepAliveThread;
 
-        private bool runThread = true;
+		private bool runThread = true;
 
         public SymetrixInterface(SymetrixPlugin parent) {
             this.parent = parent;
             this.writeQueue = new BlockingCollection<WriteQueueItem>();
+            
             readWriteThread = new Thread(readWriteLoop);
             readWriteThread.Start();
+
+            keepAliveThread= new Thread(keepAliveLoop);
+            keepAliveThread.Start();
         }
 
         private class WriteQueueItem {
@@ -43,11 +48,13 @@
         }
 
         public void connect() {
+            Debug.WriteLine("Connecting...");
             if (isConnected()) return;
             try {
                 this.client = new TcpClient("10.0.1.54", 48631);
                 this.stream = this.client.GetStream();
                 parent.OnPluginStatusChanged(PluginStatus.Normal, "Connected");
+                Debug.WriteLine("Connected");
 
                 // clear writeQueue, waking up anything waiting on it still
                 while (writeQueue.Count > 0) {
@@ -57,16 +64,21 @@
 
             } catch(Exception e) {
                 this.lastException = e.ToString();
+                Debug.WriteLine($"Exception connecting: {e}");
                 parent.OnPluginStatusChanged(PluginStatus.Error, e.ToString());
             }
         }
 
+        public void disconnect() {
+            Debug.WriteLine("Disconnecting...");
+            this.stream.Close();
+            this.stream?.Dispose();
+            this.client.Close();
+        }
+
         public void Dispose() {
             this.runThread = false;
-            this.stream.Close();
-            this.stream.Dispose();
-            this.client.Close();
-            this.client.Dispose();
+            this.disconnect();
         }
 
         public bool isConnected() {
@@ -79,7 +91,7 @@
         }
 
         public int getControl(int controllerNum) {
-			var readBlock = new AutoResetEvent(false);
+			var readBlock = new AutoResetEvent(false); // so we know when the symetrix has replied
 			var item = new WriteQueueItem($"GS {controllerNum}\r", readBlock);
 			Debug.WriteLine("getControl> Adding item to queue");
 			this.writeQueue.Add(item);
@@ -95,7 +107,7 @@
         }
 
         public bool setControl(int controllerNum, int value) {
-			var block = new AutoResetEvent(false);
+			var block = new AutoResetEvent(false); // so we know when the symetrix has replied
             var item = new WriteQueueItem($"CSQ {controllerNum} {value}\r", block);
 			Debug.WriteLine("setControl> Adding item to queue");
 			this.writeQueue.Add(item);
@@ -117,6 +129,8 @@
                 return true;
             } catch (System.IO.IOException) {
                 Debug.WriteLine("_write> Failed to write to tcp stream");
+            } catch (ObjectDisposedException) {
+                Debug.WriteLine("_write> stream object was disposed");
             }
             return false;
 		}
@@ -130,9 +144,21 @@
 				return responseData;
 			} catch (System.IO.IOException) {
                 Debug.WriteLine("_read> Failed to receive data from tcp stream");
+			} catch (ObjectDisposedException) {
+				Debug.WriteLine("_read> stream object was disposed");
 			}
-            return null;
+			return null;
 		}
+
+        private void keepAliveLoop() {
+            // this is used to periodically send a NOP to the symetrix to check if the TCP connection is happy
+            Debug.WriteLine("Starting keep alive check thread");
+            while (this.runThread) {
+                Thread.Sleep(5000);
+				var item = new WriteQueueItem($"NOP\r", null);
+                this.writeQueue.Add(item);
+			}
+        }
 
         private void readWriteLoop() {
             Debug.WriteLine("Starting read/write thread");
@@ -145,9 +171,13 @@
                     this.connect();
                 }
 
-                if (item != null) {
+                if (item != null && item.data != null) {
                     // if we have an item, write to the Symetrix and read back the ACK / data
-                    this._write(item.data);
+                    if (!this._write(item.data)) {
+                        Debug.WriteLine("readWriteLoop> Failed to write to symetrix");
+                        this.disconnect();
+                        this.connect();
+                    }
                     var retstr = this._read();
                     Debug.WriteLine($"readWriteLoop> got {retstr} back from {item.data}");
                     if (!string.IsNullOrEmpty(retstr)) {
@@ -175,8 +205,10 @@
 						}
                     } else {
                         Debug.WriteLine($"readWriteLoop> Empty return from Symetrix");
+                        this.disconnect();
+                        this.connect();
                     }
-                    item.eventHandle.Set(); // inform the process that put the item on the queue that a response has been parsed
+                    item.eventHandle?.Set(); // inform the process that put the item on the queue that a response has been parsed
                 } else {
                     Debug.WriteLine("item from writeQueue was NULL???");
                 }
